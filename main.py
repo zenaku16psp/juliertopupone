@@ -1,8 +1,8 @@
 import asyncio, os, re
 from datetime import datetime, timedelta
-from telegram import Update, Bot
+from telegram import Update, Bot, User
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ChatMember, User
 
 # env.py file မှ settings များကို import လုပ်ပါ
 try:
@@ -11,7 +11,7 @@ try:
     MONGO_URL = os.environ.get("MONGO_URL")
     
     # --- Group ID အသစ် ပြောင်းလဲမှု ---
-    ADMIN_GROUP_IDS_STR = os.environ.get("ADMIN_GROUP_IDS", "-1002921388318,-1003211952085") # 's' ပါတဲ့ variable အသစ်ကို ယူ
+    ADMIN_GROUP_IDS_STR = os.environ.get("ADMIN_GROUP_IDS") # 's' ပါတဲ့ variable အသစ်ကို ယူ
     
     if not all([BOT_TOKEN, ADMIN_ID, MONGO_URL, ADMIN_GROUP_IDS_STR]): # ADMIN_GROUP_ID အဟောင်းကို ဖြုတ်
         print("Error: Environment variables များ (BOT_TOKEN, ADMIN_ID, MONGO_URL, ADMIN_GROUP_IDS) မပြည့်စုံပါ။")
@@ -1151,28 +1151,21 @@ async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("❌ Message မပို့နိုင်ပါ။")
 
-async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User registration request"""
-    user_id = str(update.effective_user.id)
-    user = update.effective_user
+
+async def _send_registration_to_admins(user: User, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Helper function: Admin များအားလုံးထံ Registration request ကို ပို့ပေးသည်။
+    (ဤ function ကို register_command နှင့် button_callback တို့မှ ခေါ်သည်)
+    """
+    user_id = str(user.id)
     username = user.username or "-"
     name = f"{user.first_name} {user.last_name or ''}".strip()
-
+    
+    # Markdown Escape
     def escape_markdown(text):
-        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-        for char in special_chars:
-            text = text.replace(char, f'\\{char}')
-        return text
+        chars = r"_*[]()~`>#+-=|{}.!"
+        return re.sub(f'([{re.escape(chars)}])', r'\\\1', text)
     username_escaped = escape_markdown(username)
-
-    load_authorized_users()
-    if is_user_authorized(user_id):
-        await update.message.reply_text(
-            "✅ သင်သည် အသုံးပြုခွင့် ရပြီးသား ဖြစ်ပါတယ်!\n\n"
-            "🚀 /start နှိပ်ပြီး bot ကို အသုံးပြုနိုင်ပါပြီ။",
-            parse_mode="Markdown"
-        )
-        return
 
     keyboard = [[
         InlineKeyboardButton("✅ Approve", callback_data=f"register_approve_{user_id}"),
@@ -1184,43 +1177,55 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 ***Registration Request***\n\n"
         f"👤 ***User Name:*** [{name}](tg://user?id={user_id})\n"
         f"🆔 ***User ID:*** `{user_id}`\n"
-        f"📱 ***Username:*** @{username_escaped}\n"
-        f"⏰ ***Time:*** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"📱 ***Username:*** @{username_escaped}\n\n"
         f"***အသုံးပြုခွင့် ပေးမလား?***"
-    )
-
-    user_confirm_msg = (
-        f"✅ ***Registration တောင်းဆိုမှု ပို့ပြီးပါပြီ!***\n\n"
-        f"👤 ***သင့်အမည်:*** {name}\n"
-        f"🆔 ***သင့် User ID:*** `{user_id}`\n\n"
-        f"⏳ ***Owner က approve လုပ်တဲ့အထိ စောင့်ပါ။***\n"
-        f"📞 ***အရေးပေါ်ဆိုရင် owner ကို ဆက်သွယ်ပါ။***"
     )
 
     try:
         user_photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
-        if user_photos.total_count > 0:
-            await context.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=user_photos.photos[0][0].file_id,
-                caption=owner_msg,
-                parse_mode="Markdown",
-                reply_markup=reply_markup
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID, text=owner_msg, parse_mode="Markdown", reply_markup=reply_markup
-            )
+        photo_id = user_photos.photos[0][0].file_id if user_photos.total_count > 0 else None
+        
+        load_admin_ids_global() # Admin list ကို DB မှ ပြန်ခေါ်ပါ
+        for admin_id in ADMIN_IDS:
+            try:
+                if photo_id:
+                    await context.bot.send_photo(
+                        chat_id=admin_id, photo=photo_id, caption=owner_msg,
+                        parse_mode="Markdown", reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=admin_id, text=owner_msg, 
+                        parse_mode="Markdown", reply_markup=reply_markup
+                    )
+            except Exception as e_inner:
+                 print(f"Failed to send register request to admin {admin_id}: {e_inner}")
     except Exception as e:
-        print(f"Error sending registration request to owner: {e}")
-        try:
-             await context.bot.send_message(
-                chat_id=ADMIN_ID, text=owner_msg, parse_mode="Markdown", reply_markup=reply_markup
-            )
-        except Exception as e2:
-             print(f"Failed to send text-only registration request: {e2}")
+        print(f"Error sending registration request to admins: {e}")
 
+# main.py (ဤ function တစ်ခုလုံးကို အစားထိုးပါ)
+
+async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User registration request (command မှ ခေါ်လျှင်)"""
+    user = update.effective_user
+    user_id = str(user.id)
+    
+    load_authorized_users()
+    if is_user_authorized(user_id):
+        await update.message.reply_text("✅ သင်သည် အသုံးပြုခွင့် ရပြီးသား ဖြစ်ပါတယ်!\n\n🚀 /start နှိပ်ပါ။")
+        return
+
+    # Call the helper function to send message to admins
+    await _send_registration_to_admins(user, context)
+
+    # Send confirmation reply *to the message*
+    user_confirm_msg = (
+        f"✅ ***Registration တောင်းဆိုမှု ပို့ပြီးပါပြီ!***\n\n"
+        f"🆔 ***သင့် User ID:*** `{user_id}`\n\n"
+        f"⏳ ***Owner က approve လုပ်တဲ့အထိ စောင့်ပါ။***"
+    )
     try:
+        # Try to reply with photo
         user_photos = await context.bot.get_user_profile_photos(user_id=int(user_id), limit=1)
         if user_photos.total_count > 0:
             await update.message.reply_photo(
@@ -1230,7 +1235,7 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await update.message.reply_text(user_confirm_msg, parse_mode="Markdown")
-    except:
+    except Exception:
         await update.message.reply_text(user_confirm_msg, parse_mode="Markdown")
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3074,15 +3079,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif query.data == "request_register":
-        await register_command(update, context) # Call the command handler
+        user = query.from_user # Button နှိပ်သူ၏ user info ကို ယူပါ
+        user_id = str(user.id)
+        
+        load_authorized_users()
+        if is_user_authorized(user_id):
+            await query.answer("✅ သင်သည် အသုံးပြုခွင့် ရပြီးသား ဖြစ်ပါတယ်!", show_alert=True)
+            return
+
+        # Call the same helper function to send message to admins
+        await _send_registration_to_admins(user, context)
+        
+        # Send confirmation reply *by editing the button message*
         try:
-             await query.edit_message_text(
-                 "✅ ***Registration တောင်းဆိုမှု ပို့ပြီးပါပြီ!***\n\n"
-                 "⏳ ***Owner က approve လုပ်တဲ့အထိ စောင့်ပါ။***",
-                 parse_mode="Markdown"
-             )
-        except:
-            pass # Message might be deleted
+            await query.edit_message_text(
+                "✅ ***Registration တောင်းဆိုမှု ပို့ပြီးပါပြီ!***\n\n"
+                f"🆔 ***သင့် User ID:*** `{user_id}`\n\n"
+                "⏳ ***Owner က approve လုပ်တဲ့အထိ စောင့်ပါ။***",
+                parse_mode="Markdown"
+                # Button နှိပ်ပြီးရင် Keyboard ကို ဖြုတ်လိုက်ပါ
+                # reply_markup=None 
+            )
+        except Exception as e:
+            print(f"Error editing register button message: {e}")
         return
 
     elif query.data.startswith("register_approve_"):
